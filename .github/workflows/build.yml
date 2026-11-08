@@ -106,6 +106,10 @@ jobs:
           import android.os.Environment;
           import android.os.Handler;
           import android.os.Looper;
+          import android.database.Cursor;
+          import android.webkit.ServiceWorkerClient;
+          import android.webkit.ServiceWorkerController;
+          import android.widget.ProgressBar;
           import android.os.ParcelFileDescriptor;
           import android.media.MediaCodec;
           import android.media.MediaExtractor;
@@ -152,6 +156,10 @@ jobs:
           import java.util.ArrayDeque;
           import java.util.ArrayList;
           import java.util.Arrays;
+          import java.util.Collections;
+          import java.util.HashSet;
+          import java.util.Map;
+          import java.util.Set;
           import java.util.concurrent.ExecutionException;
           import java.util.concurrent.ExecutorService;
           import java.util.concurrent.Executors;
@@ -172,16 +180,46 @@ jobs:
               private static final String FOLDER = "VidGrab";
               private static final int PARALLEL = 6; // stream parts downloaded at the same time
 
-              // Finds <video> elements on the page and reports their real (non-blob) addresses.
+              // Finds videos on the page: <video> elements plus video files in the page's network log.
+              // Also sets up "long-press a video to download it".
               private static final String SCAN_JS =
-                      "(function(){try{var o=[];document.querySelectorAll('video,video source,audio source').forEach(function(e){"
+                      "(function(){try{var o=[];document.querySelectorAll('video,video source').forEach(function(e){"
                       + "var s=e.currentSrc||e.src;if(s&&s.indexOf('http')===0)o.push(s);});"
-                      + "if(o.length)VidGrab.found(JSON.stringify(o));}catch(e){}})();";
+                      + "try{performance.getEntriesByType('resource').forEach(function(e){var n=e.name||'';"
+                      + "if(/\\.(mp4|webm|m4v|mov|3gp|mkv)([?#]|$)/i.test(n)||/m3u8/i.test(n)||/mime=video/i.test(n))o.push(n);});}catch(x){}"
+                      + "if(o.length)VidGrab.found(JSON.stringify(o));}catch(e){}"
+                      + "if(window.__vgLP)return;window.__vgLP=1;var t=null,sx=0,sy=0;"
+                      + "function vidAt(x,y){try{var els=document.elementsFromPoint(x,y);for(var i=0;i<els.length;i++)if(els[i].tagName==='VIDEO')return els[i];}catch(e){}"
+                      + "var vs=document.querySelectorAll('video');for(var j=0;j<vs.length;j++){var r=vs[j].getBoundingClientRect();"
+                      + "if(r.width>0&&x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom)return vs[j];}return null;}"
+                      + "function stop(){if(t){clearTimeout(t);t=null;}}"
+                      + "document.addEventListener('touchstart',function(e){if(e.touches.length!==1){stop();return;}"
+                      + "sx=e.touches[0].clientX;sy=e.touches[0].clientY;stop();t=setTimeout(function(){t=null;var v=vidAt(sx,sy);"
+                      + "if(v)VidGrab.longPress(v.currentSrc||v.src||'');},650);},{passive:true,capture:true});"
+                      + "document.addEventListener('touchmove',function(e){var q=e.touches[0];"
+                      + "if(Math.abs(q.clientX-sx)>12||Math.abs(q.clientY-sy)>12)stop();},{passive:true,capture:true});"
+                      + "document.addEventListener('touchend',stop,{passive:true,capture:true});"
+                      + "document.addEventListener('touchcancel',stop,{passive:true,capture:true});"
+                      + "})();";
 
               private WebView web;
               private EditText address;
               private Button grabBtn;
               private TextView status;
+              private ProgressBar progress;
+              private LinearLayout statusPanel;
+              private volatile String streamMsg = null;
+              private volatile int streamPct = -1;
+              private volatile String dmMsg = null;
+              private volatile int dmPct = -1;
+              private final Set<Long> dmIds = Collections.synchronizedSet(new LinkedHashSet<>());
+
+              private final Runnable dmPoller = new Runnable() {
+                  @Override public void run() {
+                      pollDownloads();
+                      ui.postDelayed(this, 1000);
+                  }
+              };
               private final LinkedHashMap<String, String> found = new LinkedHashMap<>();
               private final Handler ui = new Handler(Looper.getMainLooper());
               private volatile String pageUrl = "";
@@ -201,6 +239,7 @@ jobs:
                   setupWebView();
                   web.loadUrl(HOME);
                   ui.postDelayed(scanner, 3000);
+                  ui.postDelayed(dmPoller, 1000);
               }
 
               // ---------- UI ----------
@@ -232,11 +271,17 @@ jobs:
                   bar.addView(goBtn, new LinearLayout.LayoutParams(WRAP, WRAP));
                   root.addView(bar, new LinearLayout.LayoutParams(MATCH, WRAP));
 
+                  statusPanel = new LinearLayout(this);
+                  statusPanel.setOrientation(LinearLayout.VERTICAL);
+                  statusPanel.setPadding(24, 0, 24, 8);
+                  statusPanel.setVisibility(View.GONE);
                   status = new TextView(this);
-                  status.setPadding(24, 0, 24, 6);
-                  status.setTextSize(12);
-                  status.setVisibility(View.GONE);
-                  root.addView(status, new LinearLayout.LayoutParams(MATCH, WRAP));
+                  status.setTextSize(13);
+                  statusPanel.addView(status, new LinearLayout.LayoutParams(MATCH, WRAP));
+                  progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  progress.setMax(100);
+                  statusPanel.addView(progress, new LinearLayout.LayoutParams(MATCH, WRAP));
+                  root.addView(statusPanel, new LinearLayout.LayoutParams(MATCH, WRAP));
 
                   FrameLayout frame = new FrameLayout(this);
                   web = new WebView(this);
@@ -299,11 +344,21 @@ jobs:
 
                       @Override
                       public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                          final String u = request.getUrl().toString();
-                          if (looksLikeVideo(u)) ui.post(() -> addFound(u));
+                          checkRequest(request);
                           return null; // let the page load normally
                       }
                   });
+
+                  // Some sites fetch videos through a background "service worker": watch those too.
+                  try {
+                      ServiceWorkerController.getInstance().setServiceWorkerClient(new ServiceWorkerClient() {
+                          @Override
+                          public WebResourceResponse shouldInterceptRequest(WebResourceRequest request) {
+                              checkRequest(request);
+                              return null;
+                          }
+                      });
+                  } catch (Exception ignored) { }
 
                   web.setWebChromeClient(new WebChromeClient() {
                       private View custom;
@@ -361,13 +416,52 @@ jobs:
               @Override
               protected void onDestroy() {
                   ui.removeCallbacks(scanner);
+                  ui.removeCallbacks(dmPoller);
                   if (web != null) web.destroy();
                   super.onDestroy();
               }
 
               // ---------- Video detection ----------
 
+              private void checkRequest(WebResourceRequest request) {
+                  final String u = request.getUrl().toString();
+                  boolean video = looksLikeVideo(u);
+                  if (!video && !isSegment(u)) {
+                      // Players ask for videos in byte ranges; that's a strong sign of a video file
+                      // even when the link has no ".mp4" in it.
+                      Map<String, String> h = request.getRequestHeaders();
+                      if (h != null) {
+                          for (Map.Entry<String, String> e : h.entrySet()) {
+                              if ("range".equalsIgnoreCase(e.getKey()) && e.getValue() != null
+                                      && e.getValue().startsWith("bytes=") && !looksLikeNonVideo(u)) {
+                                  video = true;
+                                  break;
+                              }
+                          }
+                      }
+                  }
+                  if (video) ui.post(() -> addFound(u));
+              }
+
+              private static boolean isSegment(String url) {
+                  String p = pathOf(url);
+                  return p.endsWith(".ts") || p.endsWith(".m4s") || p.endsWith(".aac") || p.endsWith(".vtt");
+              }
+
+              private static boolean looksLikeNonVideo(String url) {
+                  String p = pathOf(url);
+                  String[] skip = {".js", ".css", ".json", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+                          ".woff", ".woff2", ".ttf", ".otf", ".html", ".htm", ".mp3", ".m4a", ".ogg", ".wav", ".wasm", ".pdf"};
+                  for (String s : skip) if (p.endsWith(s)) return true;
+                  return false;
+              }
+
               private class Bridge {
+                  @JavascriptInterface
+                  public void longPress(String src) {
+                      ui.post(() -> onVideoLongPress(src));
+                  }
+
                   @JavascriptInterface
                   public void found(String json) {
                       try {
@@ -390,15 +484,16 @@ jobs:
               }
 
               private static boolean isHls(String url) {
-                  return pathOf(url).endsWith(".m3u8");
+                  return url.toLowerCase(Locale.ROOT).contains("m3u8");
               }
 
               private static boolean looksLikeVideo(String url) {
                   if (!(url.startsWith("http://") || url.startsWith("https://"))) return false;
                   String p = pathOf(url);
                   if (p.endsWith(".mp4") || p.endsWith(".webm") || p.endsWith(".m4v") || p.endsWith(".mov")
-                          || p.endsWith(".3gp") || p.endsWith(".mkv") || p.endsWith(".m3u8")) return true;
-                  return url.toLowerCase(Locale.ROOT).contains("mime=video");
+                          || p.endsWith(".3gp") || p.endsWith(".mkv")) return true;
+                  String l = url.toLowerCase(Locale.ROOT);
+                  return l.contains("m3u8") || l.contains("mime=video");
               }
 
               // Removes "partial download" parameters so we fetch the whole file.
@@ -431,31 +526,339 @@ jobs:
                   }
               }
 
+              private void onVideoLongPress(String src) {
+                  boolean real = src != null && (src.startsWith("http://") || src.startsWith("https://"));
+                  if (real) addFound(src);
+                  int n;
+                  synchronized (found) { n = found.size(); }
+                  if (real && n <= 1) {
+                      final String u = normalize(src);
+                      new AlertDialog.Builder(this)
+                              .setTitle("Download this video?")
+                              .setPositiveButton("Download", (d, w) -> startDownload(u))
+                              .setNegativeButton("Cancel", null)
+                              .show();
+                  } else if (n > 0) {
+                      showFound();
+                  } else {
+                      toast("Can't find this video's file yet. Let it play for a few seconds, then long-press again.");
+                  }
+              }
+
+              private static final Pattern DIGITS = Pattern.compile("\\d+");
+
               private void showFound() {
-                  final List<String> urls;
-                  final List<String> labels;
-                  urls = new ArrayList<>();
-                  labels = new ArrayList<>();
+                  List<String> streams = new ArrayList<>();
+                  LinkedHashMap<String, String> byPath = new LinkedHashMap<>(); // one entry per file path
                   synchronized (found) {
-                      // Full streams first: they usually hold the whole video with sound.
-                      for (int pass = 0; pass < 2; pass++) {
-                          for (java.util.Map.Entry<String, String> e : found.entrySet()) {
-                              if (isHls(e.getKey()) == (pass == 0)) {
-                                  urls.add(e.getKey());
-                                  labels.add(e.getValue());
-                              }
-                          }
+                      for (String u : found.keySet()) {
+                          if (isHls(u)) streams.add(u);
+                          else byPath.put(pathOf(u), u);
                       }
                   }
-                  if (urls.isEmpty()) {
+                  // Files whose addresses differ only by a number are pieces of one video.
+                  LinkedHashMap<String, List<String>> groups = new LinkedHashMap<>();
+                  for (String u : byPath.values()) {
+                      String key = pathOf(u).replaceAll("\\d+", "#");
+                      List<String> g = groups.get(key);
+                      if (g == null) { g = new ArrayList<>(); groups.put(key, g); }
+                      g.add(u);
+                  }
+
+                  final List<String> labels = new ArrayList<>();
+                  final List<Runnable> actions = new ArrayList<>();
+                  int i = 1;
+                  for (String u : streams) {
+                      labels.add("Full video " + (i++) + " (stream): " + lastSegment(u));
+                      actions.add(() -> startDownload(u));
+                  }
+                  for (List<String> g : groups.values()) {
+                      if (g.size() >= 2 && varyingRun(g) >= 0) {
+                          final List<String> pieces = new ArrayList<>(g);
+                          labels.add("Full video " + (i++) + " (joins all pieces): " + lastSegment(g.get(0)));
+                          actions.add(() -> {
+                              toast("Saving all pieces… keep the app open.");
+                              new Thread(() -> joinPieces(pieces)).start();
+                          });
+                      }
+                  }
+                  for (List<String> g : groups.values()) {
+                      if (g.size() >= 2 && varyingRun(g) >= 0) continue;
+                      for (String u : g) {
+                          labels.add("Video file " + (i++) + ": " + lastSegment(u));
+                          actions.add(() -> startDownload(u));
+                      }
+                  }
+                  if (labels.isEmpty()) {
                       toast("No video found yet. Press play on the video first.");
                       return;
                   }
                   new AlertDialog.Builder(this)
                           .setTitle("Videos found on this page")
-                          .setItems(labels.toArray(new String[0]), (d, which) -> startDownload(urls.get(which)))
+                          .setItems(labels.toArray(new String[0]), (d, which) -> actions.get(which).run())
                           .setNegativeButton("Cancel", null)
                           .show();
+              }
+
+              // Which number in the address changes between pieces (-1 if none).
+              private static int varyingRun(List<String> urls) {
+                  List<List<String>> runs = new ArrayList<>();
+                  int min = Integer.MAX_VALUE;
+                  for (String u : urls) {
+                      List<String> r = new ArrayList<>();
+                      Matcher m = DIGITS.matcher(pathOf(u));
+                      while (m.find()) r.add(m.group());
+                      runs.add(r);
+                      min = Math.min(min, r.size());
+                  }
+                  for (int j = min - 1; j >= 0; j--) {
+                      String first = runs.get(0).get(j);
+                      for (List<String> r : runs) {
+                          if (!r.get(j).equals(first)) return j;
+                      }
+                  }
+                  return -1;
+              }
+
+              private static long runValue(String url, int run) {
+                  Matcher m = DIGITS.matcher(pathOf(url));
+                  for (int k = 0; m.find(); k++) {
+                      if (k == run) {
+                          try { return Long.parseLong(m.group()); } catch (NumberFormatException e) { return -1; }
+                      }
+                  }
+                  return -1;
+              }
+
+              // Same address with the piece number swapped (keeps leading zeros).
+              private static String withNumber(String url, int run, long n) {
+                  int q = url.indexOf('?');
+                  String head = q >= 0 ? url.substring(0, q) : url;
+                  String tail = q >= 0 ? url.substring(q) : "";
+                  Matcher m = DIGITS.matcher(head);
+                  for (int k = 0; m.find(); k++) {
+                      if (k == run) {
+                          String old = m.group();
+                          String num = Long.toString(n);
+                          if (old.length() > 1 && old.startsWith("0")) {
+                              while (num.length() < old.length()) num = "0" + num;
+                          }
+                          return head.substring(0, m.start()) + num + head.substring(m.end()) + tail;
+                      }
+                  }
+                  return url;
+              }
+
+              private boolean exists(String url) {
+                  try {
+                      open(url).disconnect();
+                      return true;
+                  } catch (IOException e) {
+                      return false;
+                  }
+              }
+
+              private void joinPieces(List<String> seen) {
+                  File dir = new File(getCacheDir(), "p_" + System.nanoTime());
+                  dir.mkdirs();
+                  Uri out = null;
+                  ContentResolver cr = getContentResolver();
+                  ExecutorService pool = Executors.newFixedThreadPool(PARALLEL);
+                  try {
+                      int run = varyingRun(seen);
+                      String template = seen.get(0);
+                      long lo = Long.MAX_VALUE;
+                      List<long[]> order = new ArrayList<>();
+                      for (int k = 0; k < seen.size(); k++) {
+                          long v = runValue(seen.get(k), run);
+                          order.add(new long[]{v, k});
+                          if (v >= 0 && v < lo) { lo = v; template = seen.get(k); }
+                      }
+                      List<File> pieces = new ArrayList<>();
+
+                      if (lo != Long.MAX_VALUE) {
+                          // Look for earlier pieces the player didn't load.
+                          setStream("Looking for the start of the video…", -1);
+                          int back = 0;
+                          while (lo > 0 && back < 50 && exists(withNumber(template, run, lo - 1))) { lo--; back++; }
+
+                          // Download pieces in order until the website says there are no more.
+                          long n = lo;
+                          boolean end = false;
+                          while (!end && pieces.size() < 20000) {
+                              List<Future<byte[]>> batch = new ArrayList<>();
+                              for (int k = 0; k < PARALLEL; k++) {
+                                  final String u = withNumber(template, run, n + k);
+                                  batch.add(pool.submit(() -> fetchBytes(u)));
+                              }
+                              for (Future<byte[]> f : batch) {
+                                  byte[] data;
+                                  try {
+                                      data = f.get();
+                                  } catch (ExecutionException ee) {
+                                      end = true;
+                                      break;
+                                  }
+                                  File pf = new File(dir, "piece_" + pieces.size());
+                                  try (OutputStream os = new FileOutputStream(pf)) { os.write(data); }
+                                  pieces.add(pf);
+                              }
+                              for (Future<byte[]> f : batch) f.cancel(true);
+                              n += PARALLEL;
+                              setStream("Saving video… " + pieces.size() + " pieces so far", -1);
+                          }
+                      }
+
+                      if (pieces.size() < seen.size()) {
+                          // Couldn't guess the other pieces: just join the ones the player loaded.
+                          for (File f : pieces) f.delete();
+                          pieces.clear();
+                          Collections.sort(order, (x, y) -> Long.compare(x[0], y[0]));
+                          for (long[] o : order) {
+                              File pf = new File(dir, "piece_" + pieces.size());
+                              try (OutputStream os = new FileOutputStream(pf)) { os.write(fetchBytes(seen.get((int) o[1]))); }
+                              pieces.add(pf);
+                              setStream("Saving video… piece " + pieces.size() + " of " + seen.size(),
+                                      pieces.size() * 100 / seen.size());
+                          }
+                      }
+                      if (pieces.isEmpty()) throw new IOException("Couldn't download the video pieces");
+
+                      setStream("Joining " + pieces.size() + " pieces…", -1);
+                      String name = fileName(template, "mp4");
+                      out = newDownload(name, "video/mp4");
+                      boolean ok = false;
+                      try (ParcelFileDescriptor pfd = cr.openFileDescriptor(out, "rw")) {
+                          if (pfd == null) throw new IOException("Couldn't open file");
+                          remuxJoin(pieces, pfd.getFileDescriptor());   // pieces that are complete little videos
+                          ok = true;
+                      } catch (Exception e) {
+                          ok = false;
+                      }
+                      if (!ok) {
+                          // Pieces that only make sense glued together end to end.
+                          File joined = new File(dir, "joined");
+                          try (OutputStream os = new FileOutputStream(joined)) {
+                              byte[] buf = new byte[65536];
+                              for (File pf : pieces) {
+                                  try (InputStream in = new FileInputStream(pf)) {
+                                      int r;
+                                      while ((r = in.read(buf)) > 0) os.write(buf, 0, r);
+                                  }
+                              }
+                          }
+                          cr.delete(out, null, null);
+                          out = newDownload(name, "video/mp4");
+                          try (ParcelFileDescriptor pfd = cr.openFileDescriptor(out, "rw")) {
+                              if (pfd == null) throw new IOException("Couldn't open file");
+                              List<File> one = new ArrayList<>();
+                              one.add(joined);
+                              remux(one, pfd.getFileDescriptor());
+                          }
+                      }
+                      finishDownload(out);
+                      toast("Saved full video (" + pieces.size() + " pieces) to Downloads/" + FOLDER + "/" + name);
+                  } catch (Exception e) {
+                      if (out != null) {
+                          try { cr.delete(out, null, null); } catch (Exception ignored) { }
+                      }
+                      toast("Couldn't save video: " + e.getMessage());
+                  } finally {
+                      pool.shutdownNow();
+                      File[] fs = dir.listFiles();
+                      if (fs != null) for (File f : fs) f.delete();
+                      dir.delete();
+                      setStream(null, -1);
+                  }
+              }
+
+              // Joins pieces that are each a complete short video, one after another.
+              private static void remuxJoin(List<File> pieces, FileDescriptor dst) throws IOException {
+                  MediaMuxer mux = null;
+                  boolean started = false;
+                  try {
+                      mux = new MediaMuxer(dst, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+                      int vOut = -1, aOut = -1;
+                      int maxSize = 4 * 1024 * 1024;
+                      MediaExtractor first = new MediaExtractor();
+                      try {
+                          first.setDataSource(pieces.get(0).getAbsolutePath());
+                          for (int i = 0; i < first.getTrackCount(); i++) {
+                              MediaFormat f = first.getTrackFormat(i);
+                              String mime = f.getString(MediaFormat.KEY_MIME);
+                              if (mime == null) continue;
+                              if (mime.startsWith("video/") && vOut < 0) vOut = mux.addTrack(f);
+                              else if (mime.startsWith("audio/") && aOut < 0) aOut = mux.addTrack(f);
+                              else continue;
+                              if (f.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                                  maxSize = Math.max(maxSize, f.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE));
+                              }
+                          }
+                      } finally {
+                          first.release();
+                      }
+                      if (vOut < 0 && aOut < 0) throw new IOException("No playable tracks");
+                      mux.start();
+                      started = true;
+
+                      ByteBuffer buf = ByteBuffer.allocate(maxSize);
+                      MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+                      long offset = 0;
+                      long lastV = -1, lastA = -1;
+                      for (File pf : pieces) {
+                          MediaExtractor ex = new MediaExtractor();
+                          try {
+                              ex.setDataSource(pf.getAbsolutePath());
+                              int n = ex.getTrackCount();
+                              int[] map = new int[n];
+                              for (int i = 0; i < n; i++) {
+                                  map[i] = -1;
+                                  String mime = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME);
+                                  if (mime == null) continue;
+                                  if (mime.startsWith("video/") && vOut >= 0) map[i] = vOut;
+                                  else if (mime.startsWith("audio/") && aOut >= 0) map[i] = aOut;
+                                  if (map[i] >= 0) ex.selectTrack(i);
+                              }
+                              long base = ex.getSampleTime();
+                              if (base < 0) throw new IOException("Empty piece");
+                              long maxRel = 0;
+                              while (true) {
+                                  buf.clear();
+                                  int size = ex.readSampleData(buf, 0);
+                                  if (size < 0) break;
+                                  int t = ex.getSampleTrackIndex();
+                                  long rel = Math.max(0, ex.getSampleTime() - base);
+                                  if (size > 0 && t >= 0 && map[t] >= 0) {
+                                      long ts = offset + rel;
+                                      if (map[t] == vOut) { if (ts <= lastV) ts = lastV + 1; lastV = ts; }
+                                      else { if (ts <= lastA) ts = lastA + 1; lastA = ts; }
+                                      info.offset = 0;
+                                      info.size = size;
+                                      info.presentationTimeUs = ts;
+                                      info.flags = (ex.getSampleFlags() & MediaExtractor.SAMPLE_FLAG_SYNC) != 0
+                                              ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
+                                      mux.writeSampleData(map[t], buf, info);
+                                      maxRel = Math.max(maxRel, rel);
+                                  }
+                                  ex.advance();
+                              }
+                              offset += maxRel + 33000;
+                          } finally {
+                              ex.release();
+                          }
+                      }
+                      mux.stop();
+                      started = false;
+                  } catch (IOException e) {
+                      throw e;
+                  } catch (Exception e) {
+                      throw new IOException(String.valueOf(e));
+                  } finally {
+                      if (mux != null) {
+                          try { if (started) mux.stop(); } catch (Exception ignored) { }
+                          try { mux.release(); } catch (Exception ignored) { }
+                      }
+                  }
               }
 
               // ---------- Downloading ----------
@@ -481,7 +884,8 @@ jobs:
                       r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
                       r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, FOLDER + "/" + name);
                       DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-                      dm.enqueue(r);
+                      dmIds.add(dm.enqueue(r));
+                      pollDownloads();
                       toast("Downloading to Downloads/" + FOLDER);
                   } catch (Exception e) {
                       toast("Couldn't start download: " + e.getMessage());
@@ -665,7 +1069,7 @@ jobs:
                               queue.add(pool.submit(() -> fetchBytes(u)));
                           }
                           int pct = (int) ((i + 1) * 100L / total);
-                          setStatus("Saving " + label + "… " + pct + "%");
+                          setStream("Saving " + label + "… " + pct + "% (part " + (i + 1) + " of " + total + ")", pct);
                       }
                   } finally {
                       pool.shutdownNow();
@@ -869,14 +1273,106 @@ jobs:
               }
 
               private void setStatus(String msg) {
-                  ui.post(() -> {
-                      if (msg == null) {
-                          status.setVisibility(View.GONE);
-                      } else {
-                          status.setText(msg);
-                          status.setVisibility(View.VISIBLE);
+                  setStream(msg, -1);
+              }
+
+              private void setStream(String msg, int pct) {
+                  streamMsg = msg;
+                  streamPct = pct;
+                  ui.post(this::renderStatus);
+              }
+
+              private void renderStatus() {
+                  String msg = streamMsg;
+                  int pct = streamPct;
+                  if (msg == null) { msg = dmMsg; pct = dmPct; }
+                  if (msg == null) {
+                      statusPanel.setVisibility(View.GONE);
+                      return;
+                  }
+                  status.setText(msg);
+                  if (pct < 0) {
+                      progress.setIndeterminate(true);
+                  } else {
+                      progress.setIndeterminate(false);
+                      progress.setProgress(pct);
+                  }
+                  statusPanel.setVisibility(View.VISIBLE);
+              }
+
+              private static String mb(long bytes) {
+                  return String.format(Locale.ROOT, "%.1f MB", bytes / 1048576.0);
+              }
+
+              // Checks Android's download queue and updates the progress bar.
+              private void pollDownloads() {
+                  Long[] ids;
+                  synchronized (dmIds) { ids = dmIds.toArray(new Long[0]); }
+                  if (ids.length == 0) {
+                      if (dmMsg != null) { dmMsg = null; renderStatus(); }
+                      return;
+                  }
+                  long[] arr = new long[ids.length];
+                  for (int i = 0; i < ids.length; i++) arr[i] = ids[i];
+                  DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+                  long done = 0, total = 0;
+                  int active = 0;
+                  boolean unknownSize = false;
+                  String name = null;
+                  Set<Long> seen = new HashSet<>();
+                  try (Cursor c = dm.query(new DownloadManager.Query().setFilterById(arr))) {
+                      while (c != null && c.moveToNext()) {
+                          long id = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_ID));
+                          seen.add(id);
+                          int st = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
+                          String title = c.getString(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE));
+                          if (st == DownloadManager.STATUS_SUCCESSFUL) {
+                              dmIds.remove(id);
+                              toast("Saved " + title + " to Downloads/" + FOLDER);
+                          } else if (st == DownloadManager.STATUS_FAILED) {
+                              dmIds.remove(id);
+                              int reason = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON));
+                              toast("Download failed (" + reasonText(reason) + "): " + title);
+                          } else {
+                              active++;
+                              name = title;
+                              long so = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));
+                              long tot = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
+                              done += Math.max(0, so);
+                              if (tot > 0) total += tot; else unknownSize = true;
+                          }
                       }
-                  });
+                  } catch (Exception ignored) { }
+                  for (Long id : ids) if (!seen.contains(id)) dmIds.remove(id); // cancelled by the user
+                  if (active == 0) {
+                      dmMsg = null;
+                  } else {
+                      String who = active > 1 ? active + " downloads… " : "Downloading " + shorten(name) + "… ";
+                      if (total > 0 && !unknownSize) {
+                          dmPct = (int) Math.min(100, done * 100 / total);
+                          dmMsg = who + dmPct + "% (" + mb(done) + " of " + mb(total) + ")";
+                      } else {
+                          dmPct = -1;
+                          dmMsg = who + mb(done) + " so far";
+                      }
+                  }
+                  renderStatus();
+              }
+
+              private static String shorten(String s) {
+                  if (s == null) return "video";
+                  return s.length() > 28 ? s.substring(0, 28) + "…" : s;
+              }
+
+              private static String reasonText(int r) {
+                  if (r >= 400 && r < 600) return "the website refused, code " + r;
+                  switch (r) {
+                      case DownloadManager.ERROR_INSUFFICIENT_SPACE: return "phone storage is full";
+                      case DownloadManager.ERROR_TOO_MANY_REDIRECTS: return "too many redirects";
+                      case DownloadManager.ERROR_HTTP_DATA_ERROR: return "connection dropped";
+                      case DownloadManager.ERROR_CANNOT_RESUME: return "couldn't resume";
+                      default: return "error " + r;
+                  }
               }
 
               private void toast(String msg) {
