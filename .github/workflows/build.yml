@@ -106,6 +106,11 @@ jobs:
           import android.os.Environment;
           import android.os.Handler;
           import android.os.Looper;
+          import android.os.ParcelFileDescriptor;
+          import android.media.MediaCodec;
+          import android.media.MediaExtractor;
+          import android.media.MediaFormat;
+          import android.media.MediaMuxer;
           import android.provider.MediaStore;
           import android.text.InputType;
           import android.view.Gravity;
@@ -132,6 +137,11 @@ jobs:
           import org.json.JSONArray;
 
           import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileDescriptor;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.nio.ByteBuffer;
           import java.io.IOException;
           import java.io.InputStream;
           import java.io.OutputStream;
@@ -139,7 +149,13 @@ jobs:
           import java.net.URL;
           import java.net.URLEncoder;
           import java.nio.charset.StandardCharsets;
+          import java.util.ArrayDeque;
           import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.concurrent.ExecutionException;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.Future;
           import java.util.Collection;
           import java.util.LinkedHashMap;
           import java.util.LinkedHashSet;
@@ -154,6 +170,7 @@ jobs:
               private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
               private static final String HOME = "https://duckduckgo.com";
               private static final String FOLDER = "VidGrab";
+              private static final int PARALLEL = 6; // stream parts downloaded at the same time
 
               // Finds <video> elements on the page and reports their real (non-blob) addresses.
               private static final String SCAN_JS =
@@ -386,7 +403,7 @@ jobs:
 
               // Removes "partial download" parameters so we fetch the whole file.
               private static String normalize(String url) {
-                  String u = url.replaceAll("([?&])(bytestart|byteend|range)=[^&]*&?", "$1");
+                  String u = url.replaceAll("([?&])(bytestart|byteend|range|rn|rbuf|sq)=[^&]*&?", "$1");
                   if (u.endsWith("?") || u.endsWith("&")) u = u.substring(0, u.length() - 1);
                   return u;
               }
@@ -417,9 +434,18 @@ jobs:
               private void showFound() {
                   final List<String> urls;
                   final List<String> labels;
+                  urls = new ArrayList<>();
+                  labels = new ArrayList<>();
                   synchronized (found) {
-                      urls = new ArrayList<>(found.keySet());
-                      labels = new ArrayList<>(found.values());
+                      // Full streams first: they usually hold the whole video with sound.
+                      for (int pass = 0; pass < 2; pass++) {
+                          for (java.util.Map.Entry<String, String> e : found.entrySet()) {
+                              if (isHls(e.getKey()) == (pass == 0)) {
+                                  urls.add(e.getKey());
+                                  labels.add(e.getValue());
+                              }
+                          }
+                      }
                   }
                   if (urls.isEmpty()) {
                       toast("No video found yet. Press play on the video first.");
@@ -462,19 +488,48 @@ jobs:
                   }
               }
 
+              private Uri newDownload(String name, String mime) throws IOException {
+                  ContentValues cv = new ContentValues();
+                  cv.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                  cv.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                  cv.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/" + FOLDER);
+                  cv.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                  Uri u = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+                  if (u == null) throw new IOException("Couldn't create file in Downloads");
+                  return u;
+              }
+
+              private void finishDownload(Uri u) {
+                  ContentValues done = new ContentValues();
+                  done.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                  getContentResolver().update(u, done, null, null);
+              }
+
+              private static String attrStr(String line, String attr) {
+                  Matcher m = Pattern.compile(attr + "=\"([^\"]*)\"").matcher(line);
+                  if (m.find()) return m.group(1);
+                  m = Pattern.compile(attr + "=([^,]*)").matcher(line);
+                  return m.find() ? m.group(1) : null;
+              }
+
               private void downloadHls(String m3u8) {
+                  File vidTmp = new File(getCacheDir(), "v_" + System.nanoTime());
+                  File audTmp = new File(getCacheDir(), "a_" + System.nanoTime());
                   Uri out = null;
                   ContentResolver cr = getContentResolver();
                   try {
                       setStatus("Reading stream…");
-                      String playlistUrl = m3u8;
-                      String text = fetchText(playlistUrl);
+                      String videoUrl = m3u8;
+                      String audioUrl = null;
+                      String text = fetchText(m3u8);
 
-                      // A "master" playlist lists several qualities: pick the best one.
+                      // A "master" playlist lists several qualities: pick the best one,
+                      // plus its separate sound track if the site keeps sound apart.
                       if (text.contains("#EXT-X-STREAM-INF")) {
                           String[] lines = text.split("\\r?\\n");
                           long best = -1;
                           String bestUri = null;
+                          String bestAudioGroup = null;
                           for (int i = 0; i < lines.length; i++) {
                               String l = lines[i].trim();
                               if (!l.startsWith("#EXT-X-STREAM-INF")) continue;
@@ -482,73 +537,233 @@ jobs:
                               for (int j = i + 1; j < lines.length; j++) {
                                   String n = lines[j].trim();
                                   if (n.isEmpty() || n.startsWith("#")) continue;
-                                  if (bw > best) { best = bw; bestUri = n; }
+                                  if (bw > best) { best = bw; bestUri = n; bestAudioGroup = attrStr(l, "AUDIO"); }
                                   break;
                               }
                           }
                           if (bestUri == null) throw new IOException("No video found in stream");
-                          playlistUrl = resolve(m3u8, bestUri);
-                          text = fetchText(playlistUrl);
+                          videoUrl = resolve(m3u8, bestUri);
+
+                          String audioUri = null;
+                          for (String raw : lines) {
+                              String l = raw.trim();
+                              if (!l.startsWith("#EXT-X-MEDIA") || !l.contains("TYPE=AUDIO")) continue;
+                              String uri = attrStr(l, "URI");
+                              if (uri == null) continue;
+                              String group = attrStr(l, "GROUP-ID");
+                              if (bestAudioGroup != null && group != null && !bestAudioGroup.equals(group)) continue;
+                              if (audioUri == null || "YES".equals(attrStr(l, "DEFAULT"))) audioUri = uri;
+                          }
+                          if (audioUri != null) audioUrl = resolve(m3u8, audioUri);
                       }
 
-                      String[] lines = text.split("\\r?\\n");
-                      boolean byteRange = text.contains("#EXT-X-BYTERANGE");
-                      String initUri = null;
-                      Collection<String> segments = byteRange ? new LinkedHashSet<>() : new ArrayList<>();
-                      Pattern mapUri = Pattern.compile("URI=\"([^\"]+)\"");
-                      for (String raw : lines) {
-                          String l = raw.trim();
-                          if (l.isEmpty()) continue;
-                          if (l.startsWith("#EXT-X-KEY") && !l.contains("METHOD=NONE")) {
-                              throw new IOException("This video is protected and can't be saved.");
-                          }
-                          if (l.startsWith("#EXT-X-MAP")) {
-                              Matcher m = mapUri.matcher(l);
-                              if (m.find() && initUri == null) initUri = resolve(playlistUrl, m.group(1));
-                              continue;
-                          }
-                          if (l.startsWith("#")) continue;
-                          segments.add(resolve(playlistUrl, l));
-                      }
-                      if (segments.isEmpty()) throw new IOException("Stream has no video parts");
+                      boolean live = savePlaylist(videoUrl, vidTmp, audioUrl != null ? "video" : "stream");
+                      if (audioUrl != null) savePlaylist(audioUrl, audTmp, "sound");
 
-                      String first = segments.iterator().next();
-                      boolean mp4 = initUri != null || pathOf(first).endsWith(".m4s") || pathOf(first).endsWith(".mp4");
-                      String ext = mp4 ? "mp4" : "ts";
-                      String mime = mp4 ? "video/mp4" : "video/mp2t";
-                      String name = fileName(m3u8, ext);
-
-                      ContentValues cv = new ContentValues();
-                      cv.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
-                      cv.put(MediaStore.MediaColumns.MIME_TYPE, mime);
-                      cv.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/" + FOLDER);
-                      cv.put(MediaStore.MediaColumns.IS_PENDING, 1);
-                      out = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
-                      if (out == null) throw new IOException("Couldn't create file in Downloads");
-
-                      try (OutputStream os = cr.openOutputStream(out)) {
-                          if (os == null) throw new IOException("Couldn't open file for writing");
-                          if (initUri != null && !segments.contains(initUri)) copyUrl(initUri, os);
-                          int i = 0;
-                          int total = segments.size();
-                          for (String seg : segments) {
-                              i++;
-                              setStatus("Saving stream… part " + i + " of " + total);
-                              copyUrl(seg, os);
-                          }
+                      // Rebuild the pieces into one normal MP4 so every player shows the full length.
+                      setStatus("Finishing video…");
+                      String name = fileName(m3u8, "mp4");
+                      out = newDownload(name, "video/mp4");
+                      boolean ok;
+                      try (ParcelFileDescriptor pfd = cr.openFileDescriptor(out, "rw")) {
+                          if (pfd == null) throw new IOException("Couldn't open file");
+                          List<File> srcs = new ArrayList<>();
+                          srcs.add(vidTmp);
+                          if (audioUrl != null) srcs.add(audTmp);
+                          remux(srcs, pfd.getFileDescriptor());
+                          ok = true;
+                      } catch (Exception e) {
+                          ok = false;
                       }
 
-                      ContentValues done = new ContentValues();
-                      done.put(MediaStore.MediaColumns.IS_PENDING, 0);
-                      cr.update(out, done, null, null);
-                      setStatus(null);
-                      toast("Saved to Downloads/" + FOLDER + "/" + name);
+                      if (!ok) {
+                          // Fall back to saving the raw pieces joined together (plays in VLC).
+                          cr.delete(out, null, null);
+                          out = null;
+                          boolean ts = firstByte(vidTmp) == 0x47;
+                          name = fileName(m3u8, ts ? "ts" : "mp4");
+                          out = newDownload(name, ts ? "video/mp2t" : "video/mp4");
+                          try (OutputStream os = cr.openOutputStream(out);
+                               InputStream in = new FileInputStream(vidTmp)) {
+                              if (os == null) throw new IOException("Couldn't open file for writing");
+                              byte[] buf = new byte[65536];
+                              int n;
+                              while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+                          }
+                      }
+                      finishDownload(out);
+                      String msg = "Saved to Downloads/" + FOLDER + "/" + name;
+                      if (!ok) msg += " (if it won't play, open it with VLC)";
+                      if (live) msg += ". This was a live stream, so only the part available so far was saved.";
+                      toast(msg);
                   } catch (Exception e) {
                       if (out != null) {
                           try { cr.delete(out, null, null); } catch (Exception ignored) { }
                       }
-                      setStatus(null);
                       toast("Couldn't save stream: " + e.getMessage());
+                  } finally {
+                      vidTmp.delete();
+                      audTmp.delete();
+                      setStatus(null);
+                  }
+              }
+
+              private static int firstByte(File f) {
+                  try (InputStream in = new FileInputStream(f)) {
+                      return in.read();
+                  } catch (IOException e) {
+                      return -1;
+                  }
+              }
+
+              // Downloads every piece of a stream playlist into one file. Returns true if it's a live stream.
+              private boolean savePlaylist(String playlistUrl, File dest, String label) throws Exception {
+                  String text = fetchText(playlistUrl);
+                  String[] lines = text.split("\\r?\\n");
+                  boolean byteRange = text.contains("#EXT-X-BYTERANGE");
+                  String initUri = null;
+                  Collection<String> segments = byteRange ? new LinkedHashSet<>() : new ArrayList<>();
+                  for (String raw : lines) {
+                      String l = raw.trim();
+                      if (l.isEmpty()) continue;
+                      if (l.startsWith("#EXT-X-KEY") && !l.contains("METHOD=NONE")) {
+                          throw new IOException("This video is protected and can't be saved.");
+                      }
+                      if (l.startsWith("#EXT-X-MAP")) {
+                          String u = attrStr(l, "URI");
+                          if (u != null && initUri == null) initUri = resolve(playlistUrl, u);
+                          continue;
+                      }
+                      if (l.startsWith("#")) continue;
+                      segments.add(resolve(playlistUrl, l));
+                  }
+                  if (segments.isEmpty()) throw new IOException("Stream has no video parts");
+
+                  ExecutorService pool = Executors.newFixedThreadPool(PARALLEL);
+                  try (OutputStream os = new FileOutputStream(dest)) {
+                      if (initUri != null && !segments.contains(initUri)) os.write(fetchBytes(initUri));
+                      // Fetch several parts at once, but write them to the file in the right order.
+                      final List<String> segList = new ArrayList<>(segments);
+                      final int total = segList.size();
+                      ArrayDeque<Future<byte[]>> queue = new ArrayDeque<>();
+                      int next = 0;
+                      while (next < total && queue.size() < PARALLEL * 2) {
+                          final String u = segList.get(next++);
+                          queue.add(pool.submit(() -> fetchBytes(u)));
+                      }
+                      for (int i = 0; i < total; i++) {
+                          byte[] data;
+                          try {
+                              data = queue.poll().get();
+                          } catch (ExecutionException ee) {
+                              Throwable c = ee.getCause();
+                              throw (c instanceof IOException) ? (IOException) c : new IOException(String.valueOf(c));
+                          }
+                          os.write(data);
+                          if (next < total) {
+                              final String u = segList.get(next++);
+                              queue.add(pool.submit(() -> fetchBytes(u)));
+                          }
+                          int pct = (int) ((i + 1) * 100L / total);
+                          setStatus("Saving " + label + "… " + pct + "%");
+                      }
+                  } finally {
+                      pool.shutdownNow();
+                  }
+                  return !text.contains("#EXT-X-ENDLIST");
+              }
+
+              // Copies the video and sound tracks from the downloaded pieces into a standard MP4 file.
+              private static void remux(List<File> sources, FileDescriptor dst) throws IOException {
+                  List<MediaExtractor> exs = new ArrayList<>();
+                  MediaMuxer mux = null;
+                  boolean started = false;
+                  try {
+                      mux = new MediaMuxer(dst, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+                      boolean haveSeparateAudio = sources.size() > 1;
+                      List<int[]> maps = new ArrayList<>();
+                      int maxSize = 4 * 1024 * 1024;
+                      int tracks = 0;
+                      for (int s = 0; s < sources.size(); s++) {
+                          MediaExtractor ex = new MediaExtractor();
+                          exs.add(ex);
+                          ex.setDataSource(sources.get(s).getAbsolutePath());
+                          int n = ex.getTrackCount();
+                          int[] map = new int[n];
+                          for (int i = 0; i < n; i++) {
+                              map[i] = -1;
+                              MediaFormat f = ex.getTrackFormat(i);
+                              String mime = f.getString(MediaFormat.KEY_MIME);
+                              if (mime == null) continue;
+                              boolean isVideo = mime.startsWith("video/");
+                              boolean isAudio = mime.startsWith("audio/");
+                              boolean want = (s == 0) ? (isVideo || (isAudio && !haveSeparateAudio)) : isAudio;
+                              if (!want) continue;
+                              map[i] = mux.addTrack(f);
+                              ex.selectTrack(i);
+                              tracks++;
+                              if (f.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                                  maxSize = Math.max(maxSize, f.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE));
+                              }
+                          }
+                          maps.add(map);
+                      }
+                      if (tracks == 0) throw new IOException("No playable tracks");
+                      mux.start();
+                      started = true;
+
+                      long base = Long.MAX_VALUE;
+                      for (MediaExtractor ex : exs) {
+                          long t = ex.getSampleTime();
+                          if (t >= 0) base = Math.min(base, t);
+                      }
+                      if (base == Long.MAX_VALUE) base = 0;
+
+                      ByteBuffer buf = ByteBuffer.allocate(maxSize);
+                      MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+                      long[] lastTs = new long[64];
+                      Arrays.fill(lastTs, -1);
+                      while (true) {
+                          // Take the next sample in time order across all sources.
+                          int pick = -1;
+                          long pickTs = Long.MAX_VALUE;
+                          for (int s = 0; s < exs.size(); s++) {
+                              long t = exs.get(s).getSampleTime();
+                              if (t >= 0 && t < pickTs) { pickTs = t; pick = s; }
+                          }
+                          if (pick < 0) break;
+                          MediaExtractor ex = exs.get(pick);
+                          buf.clear();
+                          int size = ex.readSampleData(buf, 0);
+                          int t = ex.getSampleTrackIndex();
+                          if (size > 0 && t >= 0 && maps.get(pick)[t] >= 0) {
+                              int outTrack = maps.get(pick)[t];
+                              long ts = Math.max(0, pickTs - base);
+                              if (outTrack < lastTs.length && ts <= lastTs[outTrack]) ts = lastTs[outTrack] + 1;
+                              if (outTrack < lastTs.length) lastTs[outTrack] = ts;
+                              info.offset = 0;
+                              info.size = size;
+                              info.presentationTimeUs = ts;
+                              info.flags = (ex.getSampleFlags() & MediaExtractor.SAMPLE_FLAG_SYNC) != 0
+                                      ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
+                              mux.writeSampleData(outTrack, buf, info);
+                          }
+                          ex.advance();
+                      }
+                      mux.stop();
+                      started = false;
+                  } catch (IOException e) {
+                      throw e;
+                  } catch (Exception e) {
+                      throw new IOException(String.valueOf(e));
+                  } finally {
+                      for (MediaExtractor ex : exs) {
+                          try { ex.release(); } catch (Exception ignored) { }
+                      }
+                      if (mux != null) {
+                          try { if (started) mux.stop(); } catch (Exception ignored) { }
+                          try { mux.release(); } catch (Exception ignored) { }
+                      }
                   }
               }
 
@@ -582,7 +797,7 @@ jobs:
                   }
               }
 
-              private void copyUrl(String url, OutputStream os) throws IOException {
+              private byte[] fetchBytes(String url) throws IOException {
                   IOException last = null;
                   for (int attempt = 0; attempt < 3; attempt++) {
                       HttpURLConnection c = null;
@@ -595,8 +810,7 @@ jobs:
                               int n;
                               while ((n = in.read(buf)) > 0) b.write(buf, 0, n);
                           }
-                          b.writeTo(os);
-                          return;
+                          return b.toByteArray();
                       } catch (IOException e) {
                           last = e;
                       } finally {
