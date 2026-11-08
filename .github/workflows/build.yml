@@ -71,6 +71,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <application
                   android:label="VidGrab"
                   android:icon="@android:drawable/ic_media_play"
@@ -106,6 +107,12 @@ jobs:
           import android.os.Environment;
           import android.os.Handler;
           import android.os.Looper;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.content.pm.PackageManager;
+          import android.os.Build;
+          import android.view.MotionEvent;
           import android.database.Cursor;
           import android.webkit.ServiceWorkerClient;
           import android.webkit.ServiceWorkerController;
@@ -156,6 +163,9 @@ jobs:
           import java.util.ArrayDeque;
           import java.util.ArrayList;
           import java.util.Arrays;
+          import java.nio.channels.FileChannel;
+          import java.util.concurrent.atomic.AtomicInteger;
+          import java.util.concurrent.atomic.AtomicLong;
           import java.util.Collections;
           import java.util.HashSet;
           import java.util.Map;
@@ -178,7 +188,7 @@ jobs:
               private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
               private static final String HOME = "https://duckduckgo.com";
               private static final String FOLDER = "VidGrab";
-              private static final int PARALLEL = 6; // stream parts downloaded at the same time
+              private static final int PARALLEL = 8; // stream parts downloaded at the same time
 
               // Finds videos on the page: <video> elements plus video files in the page's network log.
               // Also sets up "long-press a video to download it".
@@ -188,18 +198,6 @@ jobs:
                       + "try{performance.getEntriesByType('resource').forEach(function(e){var n=e.name||'';"
                       + "if(/\\.(mp4|webm|m4v|mov|3gp|mkv)([?#]|$)/i.test(n)||/m3u8/i.test(n)||/mime=video/i.test(n))o.push(n);});}catch(x){}"
                       + "if(o.length)VidGrab.found(JSON.stringify(o));}catch(e){}"
-                      + "if(window.__vgLP)return;window.__vgLP=1;var t=null,sx=0,sy=0;"
-                      + "function vidAt(x,y){try{var els=document.elementsFromPoint(x,y);for(var i=0;i<els.length;i++)if(els[i].tagName==='VIDEO')return els[i];}catch(e){}"
-                      + "var vs=document.querySelectorAll('video');for(var j=0;j<vs.length;j++){var r=vs[j].getBoundingClientRect();"
-                      + "if(r.width>0&&x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom)return vs[j];}return null;}"
-                      + "function stop(){if(t){clearTimeout(t);t=null;}}"
-                      + "document.addEventListener('touchstart',function(e){if(e.touches.length!==1){stop();return;}"
-                      + "sx=e.touches[0].clientX;sy=e.touches[0].clientY;stop();t=setTimeout(function(){t=null;var v=vidAt(sx,sy);"
-                      + "if(v)VidGrab.longPress(v.currentSrc||v.src||'');},650);},{passive:true,capture:true});"
-                      + "document.addEventListener('touchmove',function(e){var q=e.touches[0];"
-                      + "if(Math.abs(q.clientX-sx)>12||Math.abs(q.clientY-sy)>12)stop();},{passive:true,capture:true});"
-                      + "document.addEventListener('touchend',stop,{passive:true,capture:true});"
-                      + "document.addEventListener('touchcancel',stop,{passive:true,capture:true});"
                       + "})();";
 
               private WebView web;
@@ -207,6 +205,7 @@ jobs:
               private Button grabBtn;
               private TextView status;
               private ProgressBar progress;
+              private float lastX, lastY;
               private LinearLayout statusPanel;
               private volatile String streamMsg = null;
               private volatile int streamPct = -1;
@@ -236,6 +235,7 @@ jobs:
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
                   buildUi();
+                  setupNotifications();
                   setupWebView();
                   web.loadUrl(HOME);
                   ui.postDelayed(scanner, 3000);
@@ -273,15 +273,17 @@ jobs:
 
                   statusPanel = new LinearLayout(this);
                   statusPanel.setOrientation(LinearLayout.VERTICAL);
-                  statusPanel.setPadding(24, 0, 24, 8);
+                  statusPanel.setPadding(32, 20, 32, 20);
+                  statusPanel.setBackgroundColor(Color.parseColor("#E6202124"));
                   statusPanel.setVisibility(View.GONE);
                   status = new TextView(this);
-                  status.setTextSize(13);
+                  status.setTextSize(15);
+                  status.setTextColor(Color.WHITE);
                   statusPanel.addView(status, new LinearLayout.LayoutParams(MATCH, WRAP));
                   progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
                   progress.setMax(100);
                   statusPanel.addView(progress, new LinearLayout.LayoutParams(MATCH, WRAP));
-                  root.addView(statusPanel, new LinearLayout.LayoutParams(MATCH, WRAP));
+
 
                   FrameLayout frame = new FrameLayout(this);
                   web = new WebView(this);
@@ -298,6 +300,8 @@ jobs:
                   FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM | Gravity.END);
                   lp.setMargins(0, 0, 32, 64);
                   frame.addView(grabBtn, lp);
+                  // Progress card floats over the top of the page so it's easy to see.
+                  frame.addView(statusPanel, new FrameLayout.LayoutParams(MATCH, WRAP, Gravity.TOP));
 
                   root.addView(frame, new LinearLayout.LayoutParams(MATCH, 0, 1f));
                   setContentView(root);
@@ -367,6 +371,7 @@ jobs:
                       public void onShowCustomView(View view, CustomViewCallback callback) {
                           custom = view;
                           custom.setBackgroundColor(Color.BLACK);
+                          custom.setOnLongClickListener(v -> { onVideoLongPress(""); return true; });
                           ((FrameLayout) getWindow().getDecorView()).addView(custom, new FrameLayout.LayoutParams(MATCH, MATCH));
                       }
 
@@ -377,6 +382,16 @@ jobs:
                               custom = null;
                           }
                       }
+                  });
+
+                  // Long-press: remember where the finger went down, then check for a video there.
+                  web.setOnTouchListener((v, e) -> {
+                      if (e.getActionMasked() == MotionEvent.ACTION_DOWN) { lastX = e.getX(); lastY = e.getY(); }
+                      return false;
+                  });
+                  web.setOnLongClickListener(v -> {
+                      checkLongPressAt(lastX, lastY);
+                      return false;
                   });
 
                   web.setDownloadListener((url, ua, contentDisposition, mimetype, length) -> {
@@ -524,6 +539,25 @@ jobs:
                       grabBtn.setText(n == 1 ? "Download video" : "Download video (" + n + ")");
                       grabBtn.setVisibility(View.VISIBLE);
                   }
+              }
+
+              @SuppressWarnings("deprecation")
+              private void checkLongPressAt(float px, float py) {
+                  float scale = web.getScale();
+                  if (scale <= 0) scale = getResources().getDisplayMetrics().density;
+                  int x = Math.round(px / scale), y = Math.round(py / scale);
+                  String js = "(function(x,y){try{var els=document.elementsFromPoint(x,y);for(var i=0;i<els.length;i++){"
+                          + "var t=els[i].tagName;if(t==='VIDEO')return 'V|'+(els[i].currentSrc||els[i].src||'');"
+                          + "if(t==='IFRAME')return 'F|';}}catch(e){}"
+                          + "var vs=document.querySelectorAll('video');for(var j=0;j<vs.length;j++){var r=vs[j].getBoundingClientRect();"
+                          + "if(r.width>0&&x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom)return 'V|'+(vs[j].currentSrc||vs[j].src||'');}"
+                          + "return 'N|';})(" + x + "," + y + ")";
+                  web.evaluateJavascript(js, value -> {
+                      String r;
+                      try { r = new JSONArray("[" + value + "]").getString(0); } catch (Exception e) { return; }
+                      if (r.startsWith("V|")) onVideoLongPress(r.substring(2));
+                      else if (r.startsWith("F|")) onVideoLongPress("");
+                  });
               }
 
               private void onVideoLongPress(String src) {
@@ -869,7 +903,136 @@ jobs:
                       new Thread(() -> downloadHls(url)).start();
                   } else {
                       String ext = extensionOf(url, "mp4");
-                      enqueueDownload(url, fileName(url, ext));
+                      String name = fileName(url, ext);
+                      toast("Downloading… keep the app open.");
+                      new Thread(() -> fastDownload(url, name, mimeFor(ext))).start();
+                  }
+              }
+
+              private static String mimeFor(String ext) {
+                  switch (ext) {
+                      case "webm": return "video/webm";
+                      case "mov": return "video/quicktime";
+                      case "3gp": return "video/3gpp";
+                      case "mkv": return "video/x-matroska";
+                      default: return "video/mp4";
+                  }
+              }
+
+              // Downloads one file over several connections at once (much faster on sites that limit each connection).
+              private void fastDownload(String url, String name, String mime) {
+                  long total = -1;
+                  try {
+                      HttpURLConnection c = open(url, "bytes=0-0");
+                      try {
+                          String cr = c.getHeaderField("Content-Range");
+                          if (c.getResponseCode() == 206 && cr != null && cr.contains("/")) {
+                              total = Long.parseLong(cr.substring(cr.lastIndexOf('/') + 1).trim());
+                          }
+                      } catch (Exception ignored) {
+                      } finally {
+                          c.disconnect();
+                      }
+                  } catch (Exception ignored) { }
+                  if (total <= 0) {
+                      // The website doesn't allow split downloads: let Android download it normally.
+                      ui.post(() -> enqueueDownload(url, name));
+                      return;
+                  }
+
+                  final long size = total;
+                  final long chunk = 2L * 1024 * 1024;
+                  final int chunks = (int) ((size + chunk - 1) / chunk);
+                  final AtomicInteger nextChunk = new AtomicInteger(0);
+                  final AtomicLong done = new AtomicLong(0);
+                  ContentResolver resolver = getContentResolver();
+                  Uri out = null;
+                  ExecutorService pool = Executors.newFixedThreadPool(PARALLEL);
+                  try {
+                      out = newDownload(name, mime);
+                      try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(out, "rw")) {
+                          if (pfd == null) throw new IOException("Couldn't open file");
+                          final FileChannel ch = new FileOutputStream(pfd.getFileDescriptor()).getChannel();
+                          List<Future<Object>> workers = new ArrayList<>();
+                          for (int w = 0; w < PARALLEL; w++) {
+                              workers.add(pool.submit(() -> {
+                                  byte[] buf = new byte[65536];
+                                  while (true) {
+                                      int idx = nextChunk.getAndIncrement();
+                                      if (idx >= chunks) return null;
+                                      long start = idx * chunk;
+                                      long end = Math.min(size, start + chunk) - 1;
+                                      IOException last = null;
+                                      boolean ok = false;
+                                      for (int attempt = 0; attempt < 4 && !ok; attempt++) {
+                                          long written = 0;
+                                          HttpURLConnection hc = null;
+                                          try {
+                                              hc = open(url, "bytes=" + start + "-" + end);
+                                              if (hc.getResponseCode() != 206) throw new IOException("Website stopped split download");
+                                              try (InputStream in = hc.getInputStream()) {
+                                                  int r;
+                                                  long pos = start;
+                                                  while ((r = in.read(buf)) > 0) {
+                                                      ByteBuffer bb = ByteBuffer.wrap(buf, 0, r);
+                                                      while (bb.hasRemaining()) pos += ch.write(bb, pos);
+                                                      written += r;
+                                                      done.addAndGet(r);
+                                                  }
+                                              }
+                                              if (written < end - start + 1) throw new IOException("Connection dropped");
+                                              ok = true;
+                                          } catch (IOException e) {
+                                              last = e;
+                                              done.addAndGet(-written);
+                                          } finally {
+                                              if (hc != null) hc.disconnect();
+                                          }
+                                      }
+                                      if (!ok) throw last;
+                                  }
+                              }));
+                          }
+                          // Show progress and speed while the workers run.
+                          long t0 = System.currentTimeMillis();
+                          long prevBytes = 0, prevTime = t0;
+                          double speed = 0;
+                          while (true) {
+                              boolean allDone = true;
+                              for (Future<Object> f : workers) if (!f.isDone()) { allDone = false; break; }
+                              long d = done.get();
+                              long now = System.currentTimeMillis();
+                              if (now - prevTime >= 1000) {
+                                  double inst = (d - prevBytes) * 1000.0 / (now - prevTime);
+                                  speed = speed == 0 ? inst : speed * 0.6 + inst * 0.4;
+                                  prevBytes = d;
+                                  prevTime = now;
+                              }
+                              int pct = (int) Math.min(100, d * 100 / size);
+                              setStream("Downloading " + shorten(name) + "… " + pct + "% (" + mb(d) + " of " + mb(size) + ")"
+                                      + (speed > 0 ? String.format(Locale.ROOT, " · %.1f MB/s", speed / 1048576.0) : ""), pct);
+                              if (allDone) break;
+                              Thread.sleep(500);
+                          }
+                          for (Future<Object> f : workers) {
+                              try {
+                                  f.get();
+                              } catch (ExecutionException ee) {
+                                  Throwable c = ee.getCause();
+                                  throw (c instanceof IOException) ? (IOException) c : new IOException(String.valueOf(c));
+                              }
+                          }
+                      }
+                      finishDownload(out);
+                      toast("Saved " + name + " to Downloads/" + FOLDER);
+                  } catch (Exception e) {
+                      if (out != null) {
+                          try { resolver.delete(out, null, null); } catch (Exception ignored) { }
+                      }
+                      toast("Download failed: " + e.getMessage());
+                  } finally {
+                      pool.shutdownNow();
+                      setStream(null, -1);
                   }
               }
 
@@ -1172,7 +1335,12 @@ jobs:
               }
 
               private HttpURLConnection open(String url) throws IOException {
+                  return open(url, null);
+              }
+
+              private HttpURLConnection open(String url, String range) throws IOException {
                   HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                  if (range != null) c.setRequestProperty("Range", range);
                   c.setInstanceFollowRedirects(true);
                   c.setConnectTimeout(15000);
                   c.setReadTimeout(30000);
@@ -1282,10 +1450,54 @@ jobs:
                   ui.post(this::renderStatus);
               }
 
+              private static final String CHANNEL = "downloads";
+              private static final int NOTE_ID = 42;
+
+              private void setupNotifications() {
+                  NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm != null) {
+                      nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Downloads", NotificationManager.IMPORTANCE_LOW));
+                  }
+                  if (Build.VERSION.SDK_INT >= 33
+                          && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
+                  }
+              }
+
+              // Shows the same progress in the notification bar, so it's visible in full-screen or outside the app.
+              private void showProgressNotification(String msg, int pct) {
+                  NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+                  try {
+                      if (msg == null) {
+                          nm.cancel(NOTE_ID);
+                          return;
+                      }
+                      Notification n = new Notification.Builder(this, CHANNEL)
+                              .setSmallIcon(android.R.drawable.stat_sys_download)
+                              .setContentTitle("VidGrab")
+                              .setContentText(msg)
+                              .setStyle(new Notification.BigTextStyle().bigText(msg))
+                              .setProgress(100, Math.max(0, pct), pct < 0)
+                              .setOngoing(true)
+                              .setOnlyAlertOnce(true)
+                              .build();
+                      nm.notify(NOTE_ID, n);
+                  } catch (Exception ignored) { }
+              }
+
+              private String lastNote = null;
+
               private void renderStatus() {
                   String msg = streamMsg;
                   int pct = streamPct;
                   if (msg == null) { msg = dmMsg; pct = dmPct; }
+                  // Only stream/split downloads go in our notification; Android shows its own for the others.
+                  String note = streamMsg;
+                  if (note == null ? lastNote != null : !note.equals(lastNote)) {
+                      showProgressNotification(note, streamPct);
+                      lastNote = note;
+                  }
                   if (msg == null) {
                       statusPanel.setVisibility(View.GONE);
                       return;
